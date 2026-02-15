@@ -34,6 +34,46 @@ We can migrate later, but only when we have **dedicated DevOps head-count**.
 
 ---
 
+### 2.1. Why We Need Fly.io (Resume Parsing Worker)
+❗ **Problem**  
+Resume parsing:  
+- Takes 3–10 seconds  
+- Calls external AI (Gemini)  
+- Can fail and require retries  
+- Cannot run inside Vercel (timeouts, cold starts, memory limits)  
+
+Vercel serverless functions:  
+- Max execution time (10–60 s depending on plan)  
+- Cold start latency  
+- No background processing  
+- Not ideal for polling loops  
+
+✅ **Solution: Dedicated Worker on Fly.io**  
+Fly.io runs a persistent Node.js container that:  
+- Polls the database every 3 seconds  
+- Processes resume parsing jobs in batches  
+- Handles retries  
+- Writes results back to Postgres  
+- Sends heartbeat to Sentry  
+
+Because it stays warm:  
+- No cold starts  
+- No polling delay  
+- Predictable latency  
+- Cheaper than Lambda  
+
+**Worker Responsibilities**  
+File: `workers/resume-queue-worker.ts`  
+Responsibilities:  
+- Poll `resume_parse_jobs`  
+- Claim jobs using `SELECT ... FOR UPDATE SKIP LOCKED`  
+- Download resume from Supabase Storage  
+- Send to Gemini for parsing  
+- Parse structured JSON  
+- Update `candidates.parsed_resume`  
+- Mark job succeeded or retry  
+
+
 ## 3.  Feature Matrix
 
 | Feature | Route/File | Auth | External Service | Critical Path | Notes |
