@@ -17,7 +17,24 @@ All traffic is **stateless**; workers pull jobs from Postgres queue table via Re
 
 ---
 
-## 2.  Feature Matrix
+## 2.  Why We Picked Each Service (Plain English)
+
+| Service | Why we chose it | What we’d need to re-write if we drop it |
+|---------|-----------------|------------------------------------------|
+| **Vercel** | Serverless that auto-scales to 100 k req/min, zero-downtime deploys, global CDN baked in. No servers to patch. | Move to AWS ECS + ALB + CloudFront + Terraform. Weeks of DevOps work. |
+| **Supabase** | Managed Postgres with 60-connection pool, row-level security, social auth, file storage in one bill. No RDS + Cognito + S3 glue. | Self-host Postgres + Auth0 + S3 + IAM policies. 3× bills, 5× complexity. |
+| **Upstash Redis** | HTTP-based Redis (no connection limit), pay-per-request, 1 GB free. Works from serverless functions. | Run Elasticache → VPC, NAT, security groups, hourly cost even idle. |
+| **Fly.io** | Keeps container warm (no cold-start), Mumbai region, free 230 h/mo. One `fly scale count 3` gives load-balancing. | Kubernetes (EKS) → nodes, cluster-autoscaler, Helm, monitoring. 10× cost. |
+| **Google Gemini** | Cheapest multi-language model (₹0.005 per resume). Fallback to OpenRouter if quota hit. | Self-host LLM → GPU nodes, model weights, autoscaling. ₹50 k/mo minimum. |
+| **Postmark** | Best deliverability for Indian ISPs, 10 k free emails/mo, bounce webhooks. | SES → set up domain reputation, DKIM, bounce handling. Same price, worse UX. |
+| **Sentry** | Auto-captures exceptions, cron heartbeats, Slack alerts, 50 k events/mo free. | Self-host Sentry → Postgres + Redis + Kafka. 2 GB RAM always on. |
+
+Bottom line: **every service is the cheapest managed tier that removes an entire layer of DevOps.**  
+We can migrate later, but only when we have **dedicated DevOps head-count**.
+
+---
+
+## 3.  Feature Matrix
 
 | Feature | Route/File | Auth | External Service | Critical Path | Notes |
 |---------|------------|------|------------------|---------------|-------|
@@ -34,7 +51,7 @@ All traffic is **stateless**; workers pull jobs from Postgres queue table via Re
 
 ---
 
-## 3.  Directory Layout (feature-wise)
+## 4.  Directory Layout (feature-wise)
 
 ```
 app/                          – Next.js App Router
@@ -76,7 +93,7 @@ supabase/                     – DDL migrations (timestamped)
 
 ---
 
-## 4.  Data Model (simplified)
+## 5.  Data Model (simplified)
 
 ```mermaid
 erDiagram
@@ -119,19 +136,6 @@ FILE_STORAGE {
   string storage_provider
 }
 ```
-
----
-
-## 5.  External Services & Keys
-
-| Service | Env Key | Used In | Failure Mode | Mitigation |
-|---------|---------|---------|--------------|------------|
-| Supabase | `SUPABASE_SERVICE_ROLE_KEY` | Every API | 5xx | Retry + circuit-breaker |
-| Upstash Redis | `REDIS_URL` | rateLimit, cache | 5xx | degrade to DB only |
-| Google Gemini | `GEMINI_API_KEY` | worker | parsing fail | fallback to OpenRouter |
-| OpenRouter | `OPENROUTER_API_KEY` | worker | same | skip if not set |
-| Postmark | `POSTMARK_SERVER_TOKEN` | email.ts | bounce | log only |
-| Sentry | `SENTRY_DSN` | logger | lost metrics | stdout still exists |
 
 ---
 
