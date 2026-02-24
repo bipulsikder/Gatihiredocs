@@ -4,14 +4,14 @@ Target scale: 1 L sign-ups, 10 k DAU, < $150 / month.
 
 ---
 
-## 0.  TL;DR Checklist
+## 0. TL;DR Checklist
 - [ ] Vercel Pro (or Hobby + usage)  
 - [ ] Supabase Pro (or Starter + usage)  
 - [ ] Upstash Redis 1 GB (free tier)  
 - [ ] Sentry Team (free 50 k errors)  
 - [ ] Postmark 10 k emails free  
 - [ ] Google Gemini PAYG  
-- [ ] Worker container (Fly.io free tier)  
+- [ ] Resume worker running (Fly.io/Railway/VM)  
 - [ ] All env vars set  
 - [ ] DB migrations pushed  
 - [ ] Worker running  
@@ -20,20 +20,37 @@ Target scale: 1 L sign-ups, 10 k DAU, < $150 / month.
 
 ---
 
-## 1.  Infrastructure (no Site24x7)
+## 1. Infrastructure (no Site24x7)
 
 | Service | Plan | Monthly Cost | Purpose | Why we chose it |
 |---------|------|--------------|---------|-----------------|
 | **Vercel** | Pro | $20 | Next.js hosting | Serverless auto-scales to 100 k req/min; zero-downtime deploys; global CDN built-in |
 | **Supabase** | Pro | $25 | Postgres, Auth, Storage | Managed Postgres with 60-connection pool, row-level security, free 8 GB RAM; Auth handles JWT & social login |
-| **Upstash Redis** | 1 GB | $0 | Rate-limit, cache, queue | HTTP-based Redis (no conn limit), pay-per-request; 1 GB free tier covers 10 k DAU |
+| **Upstash Redis** | 1 GB | $0 | Rate-limit, cache | HTTP-based Redis (no conn limit), pay-per-request; 1 GB free tier covers 10 k DAU |
 | **Sentry** | Team | $0 (< 50 k errors) | Error tracking | Auto-captures exceptions, cron heartbeats, Slack alerts; free 50 k events/mo |
 | **Postmark** | 10 k emails | $0 | Transactional email | Best deliverability for Indian ISPs; 10 k free emails/mo; bounce webhooks |
 | **Google Gemini** | PAYG | ~$20 (1 M tokens) | Resume parsing | Cheapest multi-language model; ₹0.005 per resume; fallback to OpenRouter |
-| **Fly.io** | 1 shared-CPU | $0 (< 230 h) | Worker container | Keeps container warm (no cold-start); Mumbai region; free 230 h/mo |
+| **Fly.io** | 1 shared-CPU | $0 (< 230 h) | Resume parsing worker | Always-on process to drain the DB queue (no serverless timeouts) |
 | **Total** | | **~$65** | | |
 
 ---
+
+## 1.1 Why the Worker Exists (important)
+
+Resume parsing is **asynchronous**.
+
+- The web app route `POST /api/candidate/resume/parse` uploads the file and creates DB rows (`parsing_jobs`, `resume_parse_jobs`).
+- The actual extraction (PDF/DOCX/TXT → text → fields → DB updates) is done by `workers/resume-queue-worker.ts`.
+
+Why not do this inside Vercel?
+
+- Parsing can take 10–60 seconds and can include OCR/AI calls.
+- Serverless functions can time out and cannot run an infinite loop to drain a queue reliably.
+
+If the worker is not running:
+
+- resumes still appear in Supabase Storage (upload succeeded)
+- but profile fields won’t autofill because jobs stay pending/queued
 
 ## 2.  Create Projects & Keys
 
@@ -53,7 +70,12 @@ CREATE INDEX IF NOT EXISTS idx_candidates_auth_user_id ON candidates(auth_user_i
 
 ### 2.2  Upstash Redis
 1. Upstash console → Create database → region = same as Vercel (iad/bom)  
-2. Copy **REST URL** → set as `REDIS_URL` (looks like `https://...upstash.io`)
+2. Copy **REST URL** (looks like `https://...upstash.io`) and **REST TOKEN**.
+3. Recommended env vars:
+   - `UPSTASH_REDIS_REST_URL=<REST URL>`
+   - `UPSTASH_REDIS_REST_TOKEN=<REST TOKEN>`
+
+   Both are required. (Fallback supported: `REDIS_URL` + `REDIS_TOKEN`.)
 
 ### 2.3  Sentry
 1. Sign-up → Create project (Next.js)  
@@ -72,7 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_candidates_auth_user_id ON candidates(auth_user_i
 
 ---
 
-## 3.  Vercel Project
+## 3. Vercel Project
 
 ### 3.1  Link repo
 GitHub → Import → root = `board-app` folder → Deploy
@@ -83,17 +105,19 @@ Paste exactly:
 NEXT_PUBLIC_SUPABASE_URL=<from 2.1>
 NEXT_PUBLIC_SUPABASE_ANON_KEY=<from 2.1>
 SUPABASE_SERVICE_ROLE_KEY=<from 2.1>
-REDIS_URL=<from 2.2>
+UPSTASH_REDIS_REST_URL=<from 2.2>
+UPSTASH_REDIS_REST_TOKEN=<from 2.2>
 SENTRY_DSN=<from 2.3>
 POSTMARK_SERVER_TOKEN=<from 2.4>
 GEMINI_API_KEY=<from 2.5>
 OPENROUTER_API_KEY=<optional>
 BOARD_APP_ADMIN_KEY=<random 32-char>
-WORKER_ID=vercel-prod-1
-WORKER_POLL_MS=3000
-WORKER_BATCH_SIZE=10
-WORKER_MAX_ATTEMPTS=3
 ```
+
+Notes:
+
+- `GEMINI_API_KEY`/`OPENROUTER_API_KEY` are used by the resume parsing worker and may also be used by server routes.
+- `WORKER_*` env vars are only needed for the worker (see section 5).
 
 ### 3.3  Build settings (auto-detected)
 Framework = Next.js  
@@ -103,7 +127,7 @@ Install = `npm ci`
 
 ---
 
-## 4.  Database Migrations
+## 4. Database Migrations
 ```bash
 npm i -g supabase
 supabase link --project-ref <your-ref>
@@ -112,7 +136,16 @@ supabase db push   # pushes supabase/migrations/*.sql
 
 ---
 
-## 5.  Worker Container (Fly.io – free tier)
+## 5. Resume Worker (Fly.io – free tier)
+
+Local/dev:
+
+- Run the web app: `npm run dev`
+- Run the worker (separate terminal): `npm run worker:resume`
+
+Production:
+
+- Use Node 20+ (the worker runs continuously and uses modern Node APIs)
 
 ### 5.1  Install CLI
 ```bash
@@ -155,7 +188,15 @@ primary_region = "bom"
 
 ### 5.5  Secrets
 ```bash
-fly secrets set REDIS_URL=<same as Vercel> SUPABASE_SERVICE_ROLE_KEY=<same>
+fly secrets set \
+  NEXT_PUBLIC_SUPABASE_URL=<from Supabase> \
+  SUPABASE_SERVICE_ROLE_KEY=<from Supabase> \
+  GEMINI_API_KEY=<optional but recommended> \
+  OPENROUTER_API_KEY=<optional fallback> \
+  WORKER_ID=fly-prod-1 \
+  WORKER_POLL_MS=3000 \
+  WORKER_BATCH_SIZE=10 \
+  WORKER_MAX_ATTEMPTS=3
 ```
 
 ### 5.6  Deploy
@@ -166,7 +207,7 @@ fly logs   # watch start-up
 
 ---
 
-## 6.  Health & Uptime (free)
+## 6. Health & Uptime (free)
 
 ### 6.1  Sentry Crons (free 50 k check-ins)
 Add file `app/api/cron/route.ts`:
